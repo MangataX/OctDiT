@@ -263,6 +263,10 @@ class ShuffledKeyTransformer(nn.Module):
         self.input_proj = nn.Linear(input_channels, width, device=device, dtype=dtype)
         self.output_proj = nn.Linear(width, output_channels, device=device, dtype=dtype)
         self.window_size = window_size
+        self.decoder_dx = Mlp(
+            in_features=width,
+            out_features=3,
+        ).to(device)
         self._initialize_weights()
         with torch.no_grad():
             self.output_proj.weight.zero_()
@@ -304,23 +308,38 @@ class ShuffledKeyTransformer(nn.Module):
             x[..., 1] * r + r,
             x[..., 2] * r + r,
         ) # [B, N]
-        indices = keys.sort().indices.unsqueeze(-1) # [B, N, 1]
-        assert indices.shape == (x.shape[0], x.shape[1], 1)
-        x = x.gather(dim=1, index=indices.expand_as(x)) # [B, N, 3]
+        pre_indices = keys.sort().indices.unsqueeze(-1) # [B, N, 1]
+        assert pre_indices.shape == (x.shape[0], x.shape[1], 1)
+        x = x.gather(dim=1, index=pre_indices.expand_as(x)) # [B, N, 3]
         pos_emb = get_positional_embed(
             x=x[..., 0],
             y=x[..., 1],
             z=x[..., 2],
             condition_dim=self.width,
             device=self.device,
-        )
+        ) # [B, N, CD]
         h = pos_emb
         condition = cond_as_token[0]
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             # h = block(h, condition)
             h = pos_emb + block(h, condition)
+            if (i + 1) % 3 == 0:
+                dx = self.decoder_dx(h).clamp(-1., 1.)
+                x = x + dx # [B, N, 3]
+                keys = xyz2key(
+                    x[..., 0] * r + r,
+                    x[..., 1] * r + r,
+                    x[..., 2] * r + r,
+                ) # [B, N]
+                indices = keys.sort().indices.unsqueeze(-1) # [B, N, 1]
+                assert indices.shape == (x.shape[0], x.shape[1], 1)
+                x = x.gather(dim=1, index=indices.expand_as(x)) # [B, N, 3]
+                h = h.gather(dim=1, index=indices.expand_as(h)) # [B, N, CD]
+                pos_emb = pos_emb.gather(dim=1, index=indices.expand_as(pos_emb))
+                pre_indices = pre_indices.gather(dim=1, index=indices.expand_as(pre_indices))
+
         h: Tensor = self.output_proj(h)
-        h = torch.empty_like(h).scatter(dim=1, index=indices.expand_as(h), src=h) # [B, N, 2C]
+        h = torch.empty_like(h).scatter(dim=1, index=pre_indices.expand_as(h), src=h) # [B, N, 2C]
         return h.permute(0, 2, 1)
     
 class CrossAttention(nn.Module):

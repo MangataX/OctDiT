@@ -31,13 +31,20 @@ class PointCloudSampler:
         num_points: Sequence[int],
         aux_channels: Sequence[str],
         model_kwargs_key_filter: Sequence[str] = ("*",),
-        guidance_scale: Sequence[float] = (3.0, 3.0),
+        guidance_scale: Sequence[float] = (3.0,),
+        # guidance_scale: Sequence[float] = (3.0, 3.0),
         clip_denoised: bool = True,
-        use_karras: Sequence[bool] = (True, True),
-        karras_steps: Sequence[int] = (64, 64),
-        sigma_min: Sequence[float] = (1e-3, 1e-3),
-        sigma_max: Sequence[float] = (120, 160),
-        s_churn: Sequence[float] = (3, 0),
+        # clip_denoised: bool = False,
+        # use_karras: Sequence[bool] = (True, True),
+        use_karras: Sequence[bool] = (True,),
+        karras_steps: Sequence[int] = (64,),
+        # karras_steps: Sequence[int] = (64, 64),
+        sigma_min: Sequence[float] = (1e-3,),
+        # sigma_min: Sequence[float] = (1e-3, 1e-3),
+        sigma_max: Sequence[float] = (120,),
+        # sigma_max: Sequence[float] = (120, 160),
+        s_churn: Sequence[float] = (3,),
+        # s_churn: Sequence[float] = (3, 0),
     ):
         n = len(models)
         assert n > 0
@@ -261,3 +268,4 @@ class PointCloudSampler:
             sigma_max=sigma_max,
             s_churn=s_churn,
         )
+    

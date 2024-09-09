@@ -2,15 +2,17 @@
 Adapted from: https://github.com/openai/openai/blob/55363aa496049423c37124b440e9e30366db3ed6/orc/orc/diffusion/vit.py
 """
 
-
 import math
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Literal
 
 import torch
 import torch.nn as nn
+from torch import Tensor
+from ocnn.octree import xyz2key
+from jaxtyping import Float, Int64
+from einops import rearrange
 
 from .checkpoint import checkpoint
-from .pretrained_clip import FrozenImageCLIP, ImageCLIP, ImageType
 from .util import timestep_embedding
 
 
@@ -74,11 +76,11 @@ class QKVMultiheadAttention(nn.Module):
         bs, n_ctx, width = qkv.shape
         attn_ch = width // self.heads // 3
         scale = 1 / math.sqrt(math.sqrt(attn_ch))
-        qkv = qkv.view(bs, n_ctx, self.heads, -1)
-        q, k, v = torch.split(qkv, attn_ch, dim=-1)
+        qkv = qkv.view(bs, n_ctx, self.heads, -1) # [B, N, H, C//H]
+        q, k, v = torch.split(qkv, attn_ch, dim=-1) # [B, N, H, C//3H]
         weight = torch.einsum(
             "bthc,bshc->bhts", q * scale, k * scale
-        )  # More stable with f16 than dividing afterwards
+        )  # More stable with f16 than dividing afterwards, [B, H, N, N]
         wdtype = weight.dtype
         weight = torch.softmax(weight.float(), dim=-1).type(wdtype)
         return torch.einsum("bhts,bshc->bthc", weight, v).reshape(bs, n_ctx, -1)
@@ -113,7 +115,6 @@ class ResidualAttentionBlock(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
-
 
 class Transformer(nn.Module):
     def __init__(
@@ -151,7 +152,6 @@ class Transformer(nn.Module):
             x = block(x)
         return x
 
-
 class PointDiffusionTransformer(nn.Module):
     def __init__(
         self,
@@ -159,7 +159,7 @@ class PointDiffusionTransformer(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         input_channels: int = 3,
-        output_channels: int = 3,
+        output_channels: int = 6,
         n_ctx: int = 1024,
         width: int = 512,
         layers: int = 12,
@@ -224,271 +224,379 @@ class PointDiffusionTransformer(nn.Module):
             h = h[:, sum(h.shape[1] for h in extra_tokens) :]
         h = self.output_proj(h)
         return h.permute(0, 2, 1)
-
-
-class CLIPImagePointDiffusionTransformer(PointDiffusionTransformer):
+    
+class ShuffledKeyTransformer(nn.Module):
+    '''
+    t as condition (similar to DiT), not simply add to x
+    '''
     def __init__(
         self,
         *,
         device: torch.device,
         dtype: torch.dtype,
+        input_channels: int = 3,
+        output_channels: int = 6,
+        window_size: int | None = None,
         n_ctx: int = 1024,
-        token_cond: bool = False,
-        cond_drop_prob: float = 0.0,
-        frozen_clip: bool = True,
-        cache_dir: Optional[str] = None,
-        **kwargs,
+        # width: int = 512,
+        width: int = 384,
+        layers: int = 12,
+        heads: int = 8,
     ):
-        super().__init__(device=device, dtype=dtype, n_ctx=n_ctx + int(token_cond), **kwargs)
+        super().__init__()
+        self.device = device
+        self.input_channels = input_channels
+        self.output_channels = output_channels
         self.n_ctx = n_ctx
-        self.token_cond = token_cond
-        self.clip = (FrozenImageCLIP if frozen_clip else ImageCLIP)(device, cache_dir=cache_dir)
-        self.clip_embed = nn.Linear(
-            self.clip.feature_dim, self.backbone.width, device=device, dtype=dtype
-        )
-        self.cond_drop_prob = cond_drop_prob
-
-    def cached_model_kwargs(self, batch_size: int, model_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        self.width = width
+        self.time_embedder = TimestepEmbedder(width).to(device)
+        self.ln_pre = nn.LayerNorm(width, device=device, dtype=dtype)
+        self.blocks = nn.ModuleList([
+            ConditionBlock(
+                hidden_size=width,
+                num_heads=heads,
+                window_size=window_size,
+                mlp_ratio=4.0,
+            ).to(device) for _ in range(layers)
+        ])
+        self.ln_post = nn.LayerNorm(width, device=device, dtype=dtype)
+        self.input_proj = nn.Linear(input_channels, width, device=device, dtype=dtype)
+        self.output_proj = nn.Linear(width, output_channels, device=device, dtype=dtype)
+        self.window_size = window_size
+        self._initialize_weights()
         with torch.no_grad():
-            return dict(embeddings=self.clip(batch_size, **model_kwargs))
+            self.output_proj.weight.zero_()
+            self.output_proj.bias.zero_()
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        images: Optional[Iterable[Optional[ImageType]]] = None,
-        texts: Optional[Iterable[Optional[str]]] = None,
-        embeddings: Optional[Iterable[Optional[torch.Tensor]]] = None,
-    ):
+    def _initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        nn.init.normal_(self.time_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.time_embedder.mlp[2].weight, std=0.02)
+
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        
+    def forward(self, x: Float[Tensor, "B C N"], t: Int64[Tensor, "B"]) -> Float[Tensor, "B OC N"]:
         """
         :param x: an [N x C x T] tensor.
         :param t: an [N] tensor.
-        :param images: a batch of images to condition on.
-        :param texts: a batch of texts to condition on.
-        :param embeddings: a batch of CLIP embeddings to condition on.
         :return: an [N x C' x T] tensor.
         """
         assert x.shape[-1] == self.n_ctx
+        t_embed = self.time_embedder(t)
+        return self._forward_with_cond(x, [t_embed])
 
-        t_embed = self.time_embed(timestep_embedding(t, self.backbone.width))
-        clip_out = self.clip(batch_size=len(x), images=images, texts=texts, embeddings=embeddings)
-        assert len(clip_out.shape) == 2 and clip_out.shape[0] == x.shape[0]
-
-        if self.training:
-            mask = torch.rand(size=[len(x)]) >= self.cond_drop_prob
-            clip_out = clip_out * mask[:, None].to(clip_out)
-
-        # Rescale the features to have unit variance
-        clip_out = math.sqrt(clip_out.shape[1]) * clip_out
-
-        clip_embed = self.clip_embed(clip_out)
-
-        cond = [(clip_embed, self.token_cond), (t_embed, self.time_token_cond)]
-        return self._forward_with_cond(x, cond)
-
-
-class CLIPImageGridPointDiffusionTransformer(PointDiffusionTransformer):
+    def _forward_with_cond(
+        self, x: torch.Tensor, cond_as_token: List[torch.Tensor]
+    ) -> torch.Tensor:
+        x = x.permute(0, 2, 1).contiguous()  # BCN -> BNC
+        x = (x / 4.).clamp(-1., 1.)
+        r = 4096
+        keys = xyz2key(
+            x[..., 0] * r + r,
+            x[..., 1] * r + r,
+            x[..., 2] * r + r,
+        ) # [B, N]
+        indices = keys.sort().indices.unsqueeze(-1) # [B, N, 1]
+        assert indices.shape == (x.shape[0], x.shape[1], 1)
+        x = x.gather(dim=1, index=indices.expand_as(x)) # [B, N, 3]
+        pos_emb = get_positional_embed(
+            x=x[..., 0],
+            y=x[..., 1],
+            z=x[..., 2],
+            condition_dim=self.width,
+            device=self.device,
+        )
+        h = pos_emb
+        condition = cond_as_token[0]
+        for block in self.blocks:
+            # h = block(h, condition)
+            h = pos_emb + block(h, condition)
+        h: Tensor = self.output_proj(h)
+        h = torch.empty_like(h).scatter(dim=1, index=indices.expand_as(h), src=h) # [B, N, 2C]
+        return h.permute(0, 2, 1)
+    
+class CrossAttention(nn.Module):
     def __init__(
-        self,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        n_ctx: int = 1024,
-        cond_drop_prob: float = 0.0,
-        frozen_clip: bool = True,
-        cache_dir: Optional[str] = None,
-        **kwargs,
+        self, 
+        query_dim: int, 
+        context_dim: int, 
+        heads: int = 8, 
+        dim_head: int = 64, 
+        dropout: float = 0.,
+        window_size: int | None = None,
     ):
-        clip = (FrozenImageCLIP if frozen_clip else ImageCLIP)(
-            device,
-            cache_dir=cache_dir,
+        super().__init__()
+        inner_dim = dim_head * heads
+
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        self.window_size = window_size
+
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, query_dim),
+            nn.Dropout(dropout)
         )
-        super().__init__(device=device, dtype=dtype, n_ctx=n_ctx + clip.grid_size**2, **kwargs)
-        self.n_ctx = n_ctx
-        self.clip = clip
-        self.clip_embed = nn.Sequential(
-            nn.LayerNorm(
-                normalized_shape=(self.clip.grid_feature_dim,), device=device, dtype=dtype
-            ),
-            nn.Linear(self.clip.grid_feature_dim, self.backbone.width, device=device, dtype=dtype),
+
+    def forward(self, query: Tensor, context: Tensor, mask=None):
+        h = self.heads
+        batch_size = query.shape[0]
+
+        if self.window_size is not None:
+            query = query.view(batch_size, -1, self.window_size, query.shape[-1])
+            query = query.view(-1, self.window_size, query.shape[-1])
+            context = context.view(batch_size, -1, self.window_size, context.shape[-1])
+            context = query.view(-1, self.window_size, context.shape[-1])
+
+        q = self.to_q(query)
+
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        sim: Tensor = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
+
+        # attention, what we cannot get enough of
+        attn = sim.softmax(dim=-1)
+
+        out = torch.einsum('b i j, b j d -> b i d', attn, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+
+        if self.window_size is not None:
+            out = out.view(batch_size, -1, out.shape[-1])
+
+        return self.to_out(out)
+    
+    
+class LabelEmbedder(nn.Module):
+    """
+    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
+    """
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.embedding_table = nn.Embedding(1, hidden_size)
+
+    def forward(self, labels):
+        embeddings = self.embedding_table(labels)
+        return embeddings
+    
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
         )
-        self.cond_drop_prob = cond_drop_prob
+        self.frequency_embedding_size = frequency_embedding_size
 
-    def cached_model_kwargs(self, batch_size: int, model_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        _ = batch_size
-        with torch.no_grad():
-            return dict(embeddings=self.clip.embed_images_grid(model_kwargs["images"]))
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        images: Optional[Iterable[ImageType]] = None,
-        embeddings: Optional[Iterable[torch.Tensor]] = None,
-    ):
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
         """
-        :param x: an [N x C x T] tensor.
-        :param t: an [N] tensor.
-        :param images: a batch of images to condition on.
-        :param embeddings: a batch of CLIP latent grids to condition on.
-        :return: an [N x C' x T] tensor.
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
         """
-        assert images is not None or embeddings is not None, "must specify images or embeddings"
-        assert images is None or embeddings is None, "cannot specify both images and embeddings"
-        assert x.shape[-1] == self.n_ctx
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
 
-        t_embed = self.time_embed(timestep_embedding(t, self.backbone.width))
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
 
-        if images is not None:
-            clip_out = self.clip.embed_images_grid(images)
+class ConditionBlock(nn.Module):
+    """
+    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    """
+    def __init__(self, hidden_size, num_heads, window_size: int | None = None, mlp_ratio=4.0, **block_kwargs):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        # approx_gelu = lambda: nn.GELU(approximate="tanh")
+        approx_gelu = lambda: nn.GELU() # for torch 1.7.1
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+        self.window_size = window_size
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+        self.adaLN_modulation(c).chunk(6, dim=1)
+                
+        shortcut = x
+        x = self.norm1(x)
+        B = x.shape[0]
+        N = x.shape[1]
+        CD = x.shape[-1]
+        x: Tensor = modulate(x.reshape(B, -1, CD), shift_msa, scale_msa)
+        if self.window_size is not None:
+            assert N % self.window_size == 0
+            x = x.view(B, N // self.window_size, self.window_size, CD)
+            x = x.view(-1, self.window_size, CD)
+            x = self.attn(x)
+            x = x.view(B, -1, self.window_size, CD)
+            x = x.view(B, N, CD)
         else:
-            clip_out = embeddings
+            x = self.attn(x)
+        
+        x = shortcut + gate_msa.unsqueeze(1) * x
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        
+        return x
+    
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-        if self.training:
-            mask = torch.rand(size=[len(x)]) >= self.cond_drop_prob
-            clip_out = clip_out * mask[:, None, None].to(clip_out)
-
-        clip_out = clip_out.permute(0, 2, 1)  # NCL -> NLC
-        clip_embed = self.clip_embed(clip_out)
-
-        cond = [(t_embed, self.time_token_cond), (clip_embed, True)]
-        return self._forward_with_cond(x, cond)
-
-
-class UpsamplePointDiffusionTransformer(PointDiffusionTransformer):
+class Mlp(nn.Module):
+    """ MLP as used in Vision Transformer, MLP-Mixer and related networks
+    """
     def __init__(
-        self,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        cond_input_channels: Optional[int] = None,
-        cond_ctx: int = 1024,
-        n_ctx: int = 4096 - 1024,
-        channel_scales: Optional[Sequence[float]] = None,
-        channel_biases: Optional[Sequence[float]] = None,
-        **kwargs,
+            self,
+            in_features,
+            hidden_features=None,
+            out_features=None,
+            act_layer=nn.GELU,
+            norm_layer=None,
+            bias=True,
+            drop=0.,
+            use_conv=False,
     ):
-        super().__init__(device=device, dtype=dtype, n_ctx=n_ctx + cond_ctx, **kwargs)
-        self.n_ctx = n_ctx
-        self.cond_input_channels = cond_input_channels or self.input_channels
-        self.cond_point_proj = nn.Linear(
-            self.cond_input_channels, self.backbone.width, device=device, dtype=dtype
-        )
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        # bias = to_2tuple(bias)
+        # drop_probs = to_2tuple(drop)
+        bias = (bias, bias)
+        drop_probs = (drop, drop)
+        from functools import partial
+        linear_layer = partial(nn.Conv2d, kernel_size=1) if use_conv else nn.Linear
 
-        self.register_buffer(
-            "channel_scales",
-            torch.tensor(channel_scales, dtype=dtype, device=device)
-            if channel_scales is not None
-            else None,
-        )
-        self.register_buffer(
-            "channel_biases",
-            torch.tensor(channel_biases, dtype=dtype, device=device)
-            if channel_biases is not None
-            else None,
-        )
+        self.fc1 = linear_layer(in_features, hidden_features, bias=bias[0])
+        self.act = act_layer()
+        self.drop1 = nn.Dropout(drop_probs[0])
+        self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
+        self.fc2 = linear_layer(hidden_features, out_features, bias=bias[1])
+        self.drop2 = nn.Dropout(drop_probs[1])
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, *, low_res: torch.Tensor):
-        """
-        :param x: an [N x C1 x T] tensor.
-        :param t: an [N] tensor.
-        :param low_res: an [N x C2 x T'] tensor of conditioning points.
-        :return: an [N x C3 x T] tensor.
-        """
-        assert x.shape[-1] == self.n_ctx
-        t_embed = self.time_embed(timestep_embedding(t, self.backbone.width))
-        low_res_embed = self._embed_low_res(low_res)
-        cond = [(t_embed, self.time_token_cond), (low_res_embed, True)]
-        return self._forward_with_cond(x, cond)
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.norm(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return x
+    
+class Attention(nn.Module):
+    fused_attn: torch.jit.Final[bool]
 
-    def _embed_low_res(self, x: torch.Tensor) -> torch.Tensor:
-        if self.channel_scales is not None:
-            x = x * self.channel_scales[None, :, None]
-        if self.channel_biases is not None:
-            x = x + self.channel_biases[None, :, None]
-        return self.cond_point_proj(x.permute(0, 2, 1))
-
-
-class CLIPImageGridUpsamplePointDiffusionTransformer(UpsamplePointDiffusionTransformer):
     def __init__(
-        self,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        n_ctx: int = 4096 - 1024,
-        cond_drop_prob: float = 0.0,
-        frozen_clip: bool = True,
-        cache_dir: Optional[str] = None,
-        **kwargs,
-    ):
-        clip = (FrozenImageCLIP if frozen_clip else ImageCLIP)(
-            device,
-            cache_dir=cache_dir,
-        )
-        super().__init__(device=device, dtype=dtype, n_ctx=n_ctx + clip.grid_size**2, **kwargs)
-        self.n_ctx = n_ctx
+            self,
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            attn_drop: float = 0.,
+            proj_drop: float = 0.,
+            norm_layer: nn.Module = nn.LayerNorm,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        # self.fused_attn = use_fused_attn()
 
-        self.clip = clip
-        self.clip_embed = nn.Sequential(
-            nn.LayerNorm(
-                normalized_shape=(self.clip.grid_feature_dim,), device=device, dtype=dtype
-            ),
-            nn.Linear(self.clip.grid_feature_dim, self.backbone.width, device=device, dtype=dtype),
-        )
-        self.cond_drop_prob = cond_drop_prob
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
 
-    def cached_model_kwargs(self, batch_size: int, model_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        if "images" not in model_kwargs:
-            zero_emb = torch.zeros(
-                [batch_size, self.clip.grid_feature_dim, self.clip.grid_size**2],
-                device=next(self.parameters()).device,
-            )
-            return dict(embeddings=zero_emb, low_res=model_kwargs["low_res"])
-        with torch.no_grad():
-            return dict(
-                embeddings=self.clip.embed_images_grid(model_kwargs["images"]),
-                low_res=model_kwargs["low_res"],
-            )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        *,
-        low_res: torch.Tensor,
-        images: Optional[Iterable[ImageType]] = None,
-        embeddings: Optional[Iterable[torch.Tensor]] = None,
-    ):
-        """
-        :param x: an [N x C1 x T] tensor.
-        :param t: an [N] tensor.
-        :param low_res: an [N x C2 x T'] tensor of conditioning points.
-        :param images: a batch of images to condition on.
-        :param embeddings: a batch of CLIP latent grids to condition on.
-        :return: an [N x C3 x T] tensor.
-        """
-        assert x.shape[-1] == self.n_ctx
-        t_embed = self.time_embed(timestep_embedding(t, self.backbone.width))
-        low_res_embed = self._embed_low_res(low_res)
-
-        if images is not None:
-            clip_out = self.clip.embed_images_grid(images)
-        elif embeddings is not None:
-            clip_out = embeddings
+        # if self.fused_attn:
+        #     x = F.scaled_dot_product_attention(
+        #         q, k, v,
+        #         dropout_p=self.attn_drop.p if self.training else 0.,
+        #     )
+        if False:
+            pass
         else:
-            # Support unconditional generation.
-            clip_out = torch.zeros(
-                [len(x), self.clip.grid_feature_dim, self.clip.grid_size**2],
-                dtype=x.dtype,
-                device=x.device,
-            )
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
 
-        if self.training:
-            mask = torch.rand(size=[len(x)]) >= self.cond_drop_prob
-            clip_out = clip_out * mask[:, None, None].to(clip_out)
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
 
-        clip_out = clip_out.permute(0, 2, 1)  # NCL -> NLC
-        clip_embed = self.clip_embed(clip_out)
+    
+def get_positional_embed(
+    x: Float[Tensor, "B N"], 
+    y: Float[Tensor, "B N"], 
+    z: Float[Tensor, "B N"],
+    condition_dim: int,
+    device: torch.device,
+) -> Float[Tensor, "B N CD"]:
+    assert condition_dim % 3 == 0
+    emb_x = _get_1d_pos_emb(x, condition_dim // 3) # [B, N, CD/3]
+    emb_y = _get_1d_pos_emb(y, condition_dim // 3) # [B, N, CD/3]
+    emb_z = _get_1d_pos_emb(z, condition_dim // 3) # [B, N, CD/3]
+    
+    emb = torch.cat([emb_x, emb_y, emb_z], dim=-1) # [B, N, CD]
+    return emb
 
-        cond = [(t_embed, self.time_token_cond), (clip_embed, True), (low_res_embed, True)]
-        return self._forward_with_cond(x, cond)
+def _get_1d_pos_emb(pos: Float[Tensor, "B N"], dim: int) -> Float[Tensor, "B N D"]:
+    assert dim % 2 == 0
+    omega = torch.arange(0, dim // 2, dtype=torch.float32, device=pos.device) # [D/2]
+    omega /= dim // 2 # [D/2]
+    omega = 1. / 10000**omega # [D/2]
+
+    out = pos.unsqueeze(-1) @ omega.unsqueeze(0) # [B, N, D/2]
+    emb_sin = torch.sin(out) # [B, N, D/2]
+    emb_cos = torch.cos(out) # [B, N, D/2]
+    
+    emb = torch.cat([emb_sin, emb_cos], dim=-1) # [B, N, D]
+    return emb
+    
+    

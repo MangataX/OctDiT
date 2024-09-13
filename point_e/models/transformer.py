@@ -263,10 +263,7 @@ class ShuffledKeyTransformer(nn.Module):
         self.input_proj = nn.Linear(input_channels, width, device=device, dtype=dtype)
         self.output_proj = nn.Linear(width, output_channels, device=device, dtype=dtype)
         self.window_size = window_size
-        self.decoder_dx = Mlp(
-            in_features=width,
-            out_features=3,
-        ).to(device)
+        self.decoder_dx = nn.Linear(width, 3, device=device)
         self._initialize_weights()
         with torch.no_grad():
             self.output_proj.weight.zero_()

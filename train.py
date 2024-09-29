@@ -44,6 +44,7 @@ def visualize(
     server: viser.ViserServer,
     color: tuple = (0, 0.7, 0),
     positions: np.ndarray | None = None,
+    label: int | None = None,
 ):
     if positions is None:
         model.eval()
@@ -54,8 +55,14 @@ def visualize(
             diffusions=[diffusion], 
             num_points=[args.num_points],
             aux_channels=[],
+            guidance_scale=(2.0,),
         )
-        positions = sampler.sample_batch(batch_size=1, model_kwargs=dict()).transpose(1, 2).contiguous().cpu().numpy()[0]
+        if label is not None:
+            label = torch.tensor([label], device=torch.device(args.cuda))
+        positions = sampler.sample_batch(
+            batch_size=1, 
+            model_kwargs=dict(labels=label)
+        ).transpose(1, 2).contiguous().cpu().numpy()[0]
     return server.scene.add_point_cloud(
         name=name,
         points=positions,
@@ -83,6 +90,7 @@ def train(args: Args):
             window_size=args.window_size,
             layers=args.num_layers,
             width=args.width,
+            num_classes=len(categories),
         )
     else:
         raise NotImplementedError(args.model)
@@ -115,6 +123,7 @@ def train(args: Args):
                     model=model,
                     x_start=gt_points,
                     t=torch.randint(low=0, high=diffusion.num_timesteps, size=labels.shape, device=device),
+                    model_kwargs={'labels': labels},
                 )['loss'].mean()
                 losses.append(loss.detach().item())
                 optimizer.zero_grad()
@@ -127,7 +136,15 @@ def train(args: Args):
             print(f'Epoch {epoch:>5d}: Loss = {np.mean(losses):.3f}')
 
         if epoch % 50 == 0:
-            visualize(model, diffusion, args, name=f'/history/{epoch}', server=server, color=(0, 0, 0.7))
+            visualize(
+                model, 
+                diffusion, 
+                args, 
+                name=f'/history/{epoch}', 
+                server=server, 
+                color=(0, 0, 0.7),
+                label=(epoch // 50 - 1) % len(categories)
+            )
         elif epoch % args.num_epochs_per_vis == 0:
             vis_lst.append(visualize(
                 model=model, 
@@ -138,7 +155,14 @@ def train(args: Args):
                 color=(0.7, 0, 0), 
                 positions=gt_points[0].transpose(0, 1).contiguous().cpu().numpy()
             ))
-            vis_lst.append(visualize(model, diffusion, args, name=f'{epoch}', server=server))
+            vis_lst.append(visualize(
+                model, 
+                diffusion, 
+                args, 
+                name=f'{epoch}', 
+                server=server,
+                label=(epoch // args.num_epochs_per_vis) % len(categories)
+            ))
         if len(vis_lst) > 20:
             vis_lst.pop(0).remove()
             vis_lst.pop(0).remove()

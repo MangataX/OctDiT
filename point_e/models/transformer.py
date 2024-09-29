@@ -242,6 +242,8 @@ class ShuffledKeyTransformer(nn.Module):
         width: int = 384,
         layers: int = 12,
         heads: int = 8,
+        class_dropout_prob: float = 0.1,
+        num_classes: int = 1,
     ):
         super().__init__()
         self.device = device
@@ -264,6 +266,7 @@ class ShuffledKeyTransformer(nn.Module):
         self.output_proj = nn.Linear(width, output_channels, device=device, dtype=dtype)
         self.window_size = window_size
         self.decoder_dx = nn.Linear(width, 3, device=device)
+        self.label_embedder = LabelEmbedder(num_classes, width, class_dropout_prob).to(device)
         self._initialize_weights()
         with torch.no_grad():
             self.output_proj.weight.zero_()
@@ -284,7 +287,12 @@ class ShuffledKeyTransformer(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
         
-    def forward(self, x: Float[Tensor, "B C N"], t: Int64[Tensor, "B"]) -> Float[Tensor, "B OC N"]:
+    def forward(
+        self, 
+        x: Float[Tensor, "B C N"], 
+        t: Int64[Tensor, "B"], 
+        labels: Int64[Tensor, "B"],
+    ) -> Float[Tensor, "B OC N"]:
         """
         :param x: an [N x C x T] tensor.
         :param t: an [N] tensor.
@@ -292,7 +300,10 @@ class ShuffledKeyTransformer(nn.Module):
         """
         assert x.shape[-1] == self.n_ctx
         t_embed = self.time_embedder(t)
-        return self._forward_with_cond(x, [t_embed])
+        labels_embed = self.label_embedder(labels, self.training)
+        condition = t_embed + labels_embed
+        del t_embed, labels_embed
+        return self._forward_with_cond(x, [condition])
 
     def _forward_with_cond(
         self, x: torch.Tensor, cond_as_token: List[torch.Tensor]
@@ -338,6 +349,7 @@ class ShuffledKeyTransformer(nn.Module):
         h: Tensor = self.output_proj(h)
         h = torch.empty_like(h).scatter(dim=1, index=pre_indices.expand_as(h), src=h) # [B, N, 2C]
         return h.permute(0, 2, 1)
+    
     
 class CrossAttention(nn.Module):
     def __init__(
@@ -400,11 +412,30 @@ class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
-    def __init__(self, hidden_size):
+    def __init__(self, num_classes, hidden_size, dropout_prob):
         super().__init__()
-        self.embedding_table = nn.Embedding(1, hidden_size)
+        use_cfg_embedding = dropout_prob > 0
+        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
+        self.num_classes = num_classes
+        self.dropout_prob = dropout_prob
 
-    def forward(self, labels):
+    def token_drop(self, labels, force_drop_ids=None):
+        """
+        Drops labels to enable classifier-free guidance.
+        """
+        if force_drop_ids is None:
+            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        # print('token drop drop_ids:', drop_ids, drop_ids.shape)
+        labels = torch.where(drop_ids, self.num_classes, labels)
+        return labels
+
+    def forward(self, labels, train, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+        # print('token drop labels:', labels, labels.shape)
         embeddings = self.embedding_table(labels)
         return embeddings
     
